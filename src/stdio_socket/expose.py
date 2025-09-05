@@ -49,6 +49,9 @@ def expose(
 async def _expose_stdio_async(
     command: str, socket_path: Path, ptty: bool, stdin: bool, ctrl_d: bool
 ):
+    # force line buffering
+    command = f"stdbuf -oL -eL {command}"
+    
     os.system("stty -echo raw")
     if ptty:
         # these stty settings and psuedo-tty make bash and vim work
