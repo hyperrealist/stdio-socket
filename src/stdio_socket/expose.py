@@ -50,6 +50,10 @@ async def _expose_stdio_async(
     command: str, socket_path: Path, ptty: bool, stdin: bool, ctrl_d: bool
 ):
     os.system("stty -echo raw")
+
+    # force line buffering
+    command = f"stdbuf -oL -eL {command}"
+
     if ptty:
         # these stty settings and psuedo-tty make bash and vim work
         command = f'pptty "{command}"'
