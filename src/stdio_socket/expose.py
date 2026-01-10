@@ -193,11 +193,17 @@ async def _expose_stdio_async(
         await process.wait()
         sys.stderr.write(f"\r\nProcess '{process_command}' exited.\r\n")
 
-        stdout_task.cancel()
+        # Wait for stdout to be fully drained (do_stdout exits on EOF)
+        # Use a timeout to avoid hanging if something goes wrong
         try:
-            await stdout_task
-        except asyncio.CancelledError:
-            pass
+            await asyncio.wait_for(stdout_task, timeout=5.0)
+        except TimeoutError:
+            sys.stderr.write("\r\nTimeout waiting for stdout to drain.\r\n")
+            stdout_task.cancel()
+            try:
+                await stdout_task
+            except asyncio.CancelledError:
+                pass
 
     async def monitor_system_stdin():
         """Forward system stdin to the process stdin."""
