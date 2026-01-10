@@ -35,7 +35,7 @@ def expose(
     debug_seconds: Annotated[
         int,
         typer.Option(
-            help="Seconds to wait for spacebar press to launch debug shell",
+            help="Seconds to wait for space bar press to launch debug shell",
         ),
     ] = 5,
 ):
@@ -71,9 +71,9 @@ async def _expose_stdio_async(
 
     # a list of currently connected clients
     clients: list[asyncio.StreamWriter] = []
-    # shared state for spacebar detection
-    spacebar_pressed = asyncio.Event()
-    waiting_for_spacebar = asyncio.Event()
+    # shared state for space bar detection
+    space_bar_pressed = asyncio.Event()
+    waiting_for_space_bar = asyncio.Event()
 
     async def run_command(cmd: str) -> asyncio.subprocess.Process:
         """Start a command and return the process."""
@@ -102,10 +102,10 @@ async def _expose_stdio_async(
         while True:
             char: bytes = await reader.read(1)
 
-            # Check if we're waiting for spacebar
-            if waiting_for_spacebar.is_set():
+            # Check if we're waiting for space bar
+            if waiting_for_space_bar.is_set():
                 if char == b" ":
-                    spacebar_pressed.set()
+                    space_bar_pressed.set()
                 continue
 
             if char == b"\x04" and not ctrl_d:  # Ctrl-D
@@ -143,10 +143,10 @@ async def _expose_stdio_async(
             writer.write(msg_bytes)
             await writer.drain()
 
-    async def wait_for_spacebar(seconds: int = 5) -> bool:
-        """Wait for spacebar press with countdown. Returns True if pressed."""
-        waiting_for_spacebar.set()
-        spacebar_pressed.clear()
+    async def wait_for_space_bar(seconds: int = 5) -> bool:
+        """Wait for space bar press with countdown. Returns True if pressed."""
+        waiting_for_space_bar.set()
+        space_bar_pressed.clear()
 
         await broadcast_message(
             f"\r\nPress SPACE within {seconds} secs to launch debug shell\r"
@@ -155,7 +155,7 @@ async def _expose_stdio_async(
             for _ in range(seconds, 0, -1):
                 try:
                     await asyncio.wait_for(
-                        asyncio.shield(spacebar_pressed.wait()),
+                        asyncio.shield(space_bar_pressed.wait()),
                         timeout=1.0,
                     )
                     await broadcast_message("\r\nLaunching debug shell...\r\n")
@@ -164,7 +164,7 @@ async def _expose_stdio_async(
                     pass
             return False
         finally:
-            waiting_for_spacebar.clear()
+            waiting_for_space_bar.clear()
 
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle a new client connection."""
@@ -179,6 +179,26 @@ async def _expose_stdio_async(
             writer.close()
             await writer.wait_closed()
 
+    async def await_process(process_command: str) -> None:
+        """monitor process's stdin/stdout, wait for exit"""
+
+        # Start new stdout forwarding for the process
+        stdout_task = asyncio.create_task(do_stdout())
+
+        # Start monitoring system stdin and forward it to the process
+        if stdin:
+            asyncio.create_task(monitor_system_stdin())
+
+        # Wait for the process to exit
+        await process.wait()
+        sys.stderr.write(f"\r\nProcess '{process_command}' exited.\r\n")
+
+        stdout_task.cancel()
+        try:
+            await stdout_task
+        except asyncio.CancelledError:
+            pass
+
     async def monitor_system_stdin():
         """Forward system stdin to the process stdin."""
 
@@ -192,46 +212,18 @@ async def _expose_stdio_async(
         # Start the main process
         process = await run_command(command)
 
-        # Start forwarding stdout and stderr to sys.stdout and connected clients
-        stdout_task = asyncio.create_task(do_stdout())
-
-        # Start monitoring system stdin and forward it to the process
-        if stdin:
-            asyncio.create_task(monitor_system_stdin())
-
         # Create a Unix domain socket server, calling handle_client for each connection
         server = await asyncio.start_unix_server(handle_client, path=str(socket_path))
         sys.stderr.write(f"\r\nSocket created at {socket_path}.\r\n")
         asyncio.create_task(server.serve_forever())
 
-        """Monitor the process and exit when it terminates."""
-        await process.wait()
-        sys.stderr.write("\r\nProcess exited.\r\n")
+        # Monitor the main process
+        await await_process(command)
 
-        # Wait for stdout to finish draining
-        stdout_task.cancel()
-        try:
-            await stdout_task
-        except asyncio.CancelledError:
-            pass
-
-        # Wait for spacebar to launch debug shell
-        if await wait_for_spacebar(debug_seconds):
-            # Launch debug shell
+        # Wait for space bar to launch debug shell
+        if await wait_for_space_bar(debug_seconds):
             process = await run_command(debug_shell)
-
-            # Start new stdout forwarding for the debug shell
-            stdout_task = asyncio.create_task(do_stdout())
-
-            # Wait for debug shell to exit
-            await process.wait()
-            sys.stderr.write("\r\nDebug shell exited. Cleaning up...\r\n")
-
-            stdout_task.cancel()
-            try:
-                await stdout_task
-            except asyncio.CancelledError:
-                pass
+            await await_process(debug_shell)
 
         sys.stderr.write("\r\nCleaning up...\r\n")
         server.close()
