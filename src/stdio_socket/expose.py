@@ -8,7 +8,6 @@ from typing import Annotated
 
 import typer
 
-from . import __version__
 from .version import version_callback
 
 __all__ = ["expose"]
@@ -33,6 +32,12 @@ def expose(
     debug_shell: Annotated[
         str, typer.Option(help="Debug shell command to run after main process exits")
     ] = "/bin/bash",
+    debug_seconds: Annotated[
+        int,
+        typer.Option(
+            help="Seconds to wait for spacebar press to launch debug shell",
+        ),
+    ] = 5,
 ):
     """
     Expose the stdio of a process on a socket at unix:///tmp/stdio.sock.
@@ -46,7 +51,11 @@ def expose(
     or use the built in client:
         console
     """
-    asyncio.run(_expose_stdio_async(command, socket, ptty, stdin, ctrl_d, debug_shell))
+    asyncio.run(
+        _expose_stdio_async(
+            command, socket, ptty, stdin, ctrl_d, debug_shell, debug_seconds
+        )
+    )
 
 
 async def _expose_stdio_async(
@@ -56,6 +65,7 @@ async def _expose_stdio_async(
     stdin: bool,
     ctrl_d: bool,
     debug_shell: str,
+    debug_seconds: int,
 ):
     os.system("stty -echo raw")
 
@@ -83,8 +93,6 @@ async def _expose_stdio_async(
         )
         sys.stderr.write(f"Process started with PID {process.pid}\n")
         return process
-
-    process = await run_command(command)
 
     async def do_stdin(reader: asyncio.StreamReader, allow_break: bool = False):
         """read stdin from a stream and forward to the process stdin"""
@@ -135,15 +143,16 @@ async def _expose_stdio_async(
             writer.write(msg_bytes)
             await writer.drain()
 
-    async def wait_for_spacebar_with_countdown(seconds: int = 3) -> bool:
+    async def wait_for_spacebar(seconds: int = 5) -> bool:
         """Wait for spacebar press with countdown. Returns True if pressed."""
         waiting_for_spacebar.set()
         spacebar_pressed.clear()
 
-        await broadcast_message("\r\nPress SPACE within 3 secs to launch debug shell\r")
+        await broadcast_message(
+            f"\r\nPress SPACE within {seconds} secs to launch debug shell\r"
+        )
         try:
             for _ in range(seconds, 0, -1):
-                await broadcast_message(msg)
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(spacebar_pressed.wait()),
@@ -180,8 +189,8 @@ async def _expose_stdio_async(
         await do_stdin(reader)
 
     try:
-        msg = f"\r\n>> launching {command} using stdio-socket v{__version__} <<\r\n"
-        sys.stderr.write(msg)
+        # Start the main process
+        process = await run_command(command)
 
         # Start forwarding stdout and stderr to sys.stdout and connected clients
         stdout_task = asyncio.create_task(do_stdout())
@@ -207,7 +216,7 @@ async def _expose_stdio_async(
             pass
 
         # Wait for spacebar to launch debug shell
-        if await wait_for_spacebar_with_countdown(3):
+        if await wait_for_spacebar(debug_seconds):
             # Launch debug shell
             process = await run_command(debug_shell)
 
@@ -223,9 +232,8 @@ async def _expose_stdio_async(
                 await stdout_task
             except asyncio.CancelledError:
                 pass
-        else:
-            sys.stderr.write("\r\nCleaning up...\r\n")
 
+        sys.stderr.write("\r\nCleaning up...\r\n")
         server.close()
 
     finally:
