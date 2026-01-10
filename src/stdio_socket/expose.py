@@ -67,7 +67,7 @@ async def _expose_stdio_async(
     debug_shell: str,
     debug_seconds: int,
 ):
-    os.system("stty -echo raw")
+    os.system("stty -echo  raw")
 
     # a list of currently connected clients
     clients: list[asyncio.StreamWriter] = []
@@ -117,7 +117,7 @@ async def _expose_stdio_async(
                 process.stdin.write(char)
                 await process.stdin.drain()
 
-    async def do_stdout():
+    async def do_stdout() -> None:
         """Forward process stdout/stderr to sys.stdout and connected clients"""
         nonlocal process
         assert process.stdout is not None  # for typechecker
