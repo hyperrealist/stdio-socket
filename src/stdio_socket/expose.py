@@ -30,6 +30,9 @@ def expose(
     ptty: Annotated[bool, typer.Option(help="enable psuedo tty")] = False,
     stdin: Annotated[bool, typer.Option(help="enable stdin on main process")] = False,
     ctrl_d: Annotated[bool, typer.Option(help="enable Ctrl-D")] = False,
+    debug_shell: Annotated[
+        str, typer.Option(help="Debug shell command to run after main process exits")
+    ] = "/bin/bash",
 ):
     """
     Expose the stdio of a process on a socket at unix:///tmp/stdio.sock.
@@ -43,41 +46,60 @@ def expose(
     or use the built in client:
         console
     """
-    asyncio.run(_expose_stdio_async(command, socket, ptty, stdin, ctrl_d))
+    asyncio.run(_expose_stdio_async(command, socket, ptty, stdin, ctrl_d, debug_shell))
 
 
 async def _expose_stdio_async(
-    command: str, socket_path: Path, ptty: bool, stdin: bool, ctrl_d: bool
+    command: str,
+    socket_path: Path,
+    ptty: bool,
+    stdin: bool,
+    ctrl_d: bool,
+    debug_shell: str,
 ):
     os.system("stty -echo raw")
 
-    # force line buffering
-    command = f"stdbuf -oL -eL {command}"
-
-    if ptty:
-        # these stty settings and psuedo-tty make bash and vim work
-        command = f'pptty "{command}"'
-
     # a list of currently connected clients
     clients: list[asyncio.StreamWriter] = []
+    # shared state for spacebar detection
+    spacebar_pressed = asyncio.Event()
+    waiting_for_spacebar = asyncio.Event()
 
-    # Start the process and pass the current environment variables
-    process = await asyncio.create_subprocess_shell(
-        command,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        env=os.environ,
-    )
+    async def run_command(cmd: str) -> asyncio.subprocess.Process:
+        """Start a command and return the process."""
+        # force line buffering
+        full_cmd = f"stdbuf -oL -eL {cmd}"
 
-    sys.stderr.write(f"Process started with PID {process.pid}\n")
+        if ptty:
+            # these stty settings and psuedo-tty make bash and vim work
+            full_cmd = f'pptty "{full_cmd}"'
+
+        process = await asyncio.create_subprocess_shell(
+            full_cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=os.environ,
+        )
+        sys.stderr.write(f"Process started with PID {process.pid}\n")
+        return process
+
+    process = await run_command(command)
 
     async def do_stdin(reader: asyncio.StreamReader, allow_break: bool = False):
         """read stdin from a stream and forward to the process stdin"""
+        nonlocal process
         assert process.stdin is not None  # for typechecker
 
         while True:
             char: bytes = await reader.read(1)
+
+            # Check if we're waiting for spacebar
+            if waiting_for_spacebar.is_set():
+                if char == b" ":
+                    spacebar_pressed.set()
+                continue
+
             if char == b"\x04" and not ctrl_d:  # Ctrl-D
                 sys.stderr.write("Ctrl-D received, NOT exiting...\n")
                 continue
@@ -89,6 +111,7 @@ async def _expose_stdio_async(
 
     async def do_stdout():
         """Forward process stdout/stderr to sys.stdout and connected clients"""
+        nonlocal process
         assert process.stdout is not None  # for typechecker
 
         while True:
@@ -102,6 +125,37 @@ async def _expose_stdio_async(
                 # insert a carriage return before newlines
                 writer.write(block)
                 await writer.drain()
+
+    async def broadcast_message(message: str):
+        """Write a message to stderr and all connected clients."""
+        msg_bytes = message.encode()
+        sys.stderr.write(message)
+        sys.stderr.flush()
+        for writer in clients:
+            writer.write(msg_bytes)
+            await writer.drain()
+
+    async def wait_for_spacebar_with_countdown(seconds: int = 3) -> bool:
+        """Wait for spacebar press with countdown. Returns True if pressed."""
+        waiting_for_spacebar.set()
+        spacebar_pressed.clear()
+
+        await broadcast_message("\r\nPress SPACE within 3 secs to launch debug shell\r")
+        try:
+            for _ in range(seconds, 0, -1):
+                await broadcast_message(msg)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(spacebar_pressed.wait()),
+                        timeout=1.0,
+                    )
+                    await broadcast_message("\r\nLaunching debug shell...\r\n")
+                    return True
+                except TimeoutError:
+                    pass
+            return False
+        finally:
+            waiting_for_spacebar.clear()
 
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle a new client connection."""
@@ -130,7 +184,7 @@ async def _expose_stdio_async(
         sys.stderr.write(msg)
 
         # Start forwarding stdout and stderr to sys.stdout and connected clients
-        asyncio.create_task(do_stdout())
+        stdout_task = asyncio.create_task(do_stdout())
 
         # Start monitoring system stdin and forward it to the process
         if stdin:
@@ -143,7 +197,35 @@ async def _expose_stdio_async(
 
         """Monitor the process and exit when it terminates."""
         await process.wait()
-        sys.stderr.write("\r\nProcess exited. Cleaning up...\r\n")
+        sys.stderr.write("\r\nProcess exited.\r\n")
+
+        # Wait for stdout to finish draining
+        stdout_task.cancel()
+        try:
+            await stdout_task
+        except asyncio.CancelledError:
+            pass
+
+        # Wait for spacebar to launch debug shell
+        if await wait_for_spacebar_with_countdown(3):
+            # Launch debug shell
+            process = await run_command(debug_shell)
+
+            # Start new stdout forwarding for the debug shell
+            stdout_task = asyncio.create_task(do_stdout())
+
+            # Wait for debug shell to exit
+            await process.wait()
+            sys.stderr.write("\r\nDebug shell exited. Cleaning up...\r\n")
+
+            stdout_task.cancel()
+            try:
+                await stdout_task
+            except asyncio.CancelledError:
+                pass
+        else:
+            sys.stderr.write("\r\nCleaning up...\r\n")
+
         server.close()
 
     finally:
